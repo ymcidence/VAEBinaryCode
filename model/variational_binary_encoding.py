@@ -1,4 +1,5 @@
 import tensorflow as tf
+import cmath
 from util import layers
 
 NAME_SCOPE_VARIATION = 'VariationalNet'
@@ -18,7 +19,7 @@ def variational_net(input_tensor, latent_size):
         fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 1024)
         fc_2 = layers.fc_relu_layer('Fc2', fc_1, 1024)
         variational_mean = layers.fc_layer('VMean', fc_2, latent_size)
-        variational_log_sigma = layers.fc_layer('LogSiagma', fc_2, latent_size)
+        variational_log_sigma = layers.fc_layer('LogSigma', fc_2, latent_size)
     return variational_mean, variational_log_sigma
 
 
@@ -26,15 +27,16 @@ def generative_net(input_tensor):
     """
     A network to rebuild the data from latent representation.
     :param input_tensor:
-    :return fc_3:
+    :return fc_3_mean:
+    :return fc_3_sigma:
 
     """
     with tf.variable_scope(NAME_SCOPE_GENERATION):
         fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 1024)
         fc_2 = layers.fc_relu_layer('Fc2', fc_1, 1024)
-        fc_3 = layers.fc_layer('Fc3', fc_2, 1024)
-        fc_3 = tf.sigmoid(fc_3)
-    return fc_3
+        fc_3_mean = layers.fc_layer('Fc3Mean', fc_2, 1024)
+        fc_3_sigma = layers.fc_layer('Fc3Sigma', fc_2, 1024)
+    return fc_3_mean, fc_3_sigma
 
 
 def recognition_net(input_tensor, label_size):
@@ -51,11 +53,34 @@ def recognition_net(input_tensor, label_size):
     return prob
 
 
-def losses(variational_mean, variational_log_sigma, generated_data, real_data, pre_labels=None, labels=None):
-    assert (pre_labels is None) == (labels is None)
-    # KL-Divergence of q(z|x) and p(z)
+def loss_kl(variational_mean, variational_log_sigma):
+    """
+    KL-Divergence of q(z|x) and p(z)
+    :param variational_mean:
+    :param variational_log_sigma:
+    :return:
+    """
     variational_loss = -0.5 * tf.reduce_sum(
         1 + variational_log_sigma - tf.square(variational_mean) - tf.exp(variational_log_sigma), axis=1)
+    return variational_loss
 
-    # p(x|z)
-    generative_loss = tf.reduce_sum()
+
+def loss_px(generated_mean, generated_sigma, real_data):
+    """
+    p(x|z)
+    :param generated_mean:
+    :param generated_sigma:
+    :param real_data:
+    :return:
+    """
+    c = -0.5 * cmath.log(2 * cmath.pi)
+    generative_loss = tf.square(real_data - generated_mean) / (2. * tf.exp(generated_sigma)) - c + generated_sigma / 2.
+    return generative_loss
+
+
+class BinaryEncodingVae(object):
+    def __init__(self, code_length, sess=tf.Session()):
+        self.sess = sess
+        self.code_length = code_length
+        self.data_feature = tf.placeholder(tf.float32, [None, None])
+        self.matrix_r = tf.Variable(initial_value=tf.eye(code_length, code_length), trainable=False)
