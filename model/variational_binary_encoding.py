@@ -3,41 +3,43 @@ import cmath
 from util import layers
 
 NAME_SCOPE_VARIATION = 'VariationalNet'
+SUB_SCOPE_VARIATION_PZX = 'Pzx'
+SUB_SCOPE_VARIATION_PZXB = 'Pzxb'
 NAME_SCOPE_GENERATION = 'GenerativeNet'
 NAME_SCOPE_RECOGNITION = 'RecognitionNet'
 NAME_SCOPE_CODE_LEARNING = 'CodeLearning'
 
 
-def variational_net(input_tensor, latent_size):
+def variational_net(input_tensor, latent_size, sub_scope):
     """
     A variational approximation of p(z) with neural network.
     :param input_tensor:
     :param latent_size: the size of the latent space
+    :param sub_scope:
     :return variational_mean:
     :return variational_log_sigma:
     """
-    with tf.variable_scope(NAME_SCOPE_VARIATION):
-        fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 1024)
-        fc_2 = layers.fc_relu_layer('Fc2', fc_1, 1024)
-        variational_mean = layers.fc_layer('VMean', fc_2, latent_size)
-        variational_log_sigma = layers.fc_layer('LogSigma', fc_2, latent_size)
+    with tf.variable_scope(NAME_SCOPE_VARIATION + '/' + sub_scope):
+        fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 512)
+        fc_2 = layers.fc_relu_layer('Fc2', fc_1, 512)
+        variational_mean = tf.sigmoid(layers.fc_layer('VMean', fc_2, latent_size))
+        variational_log_sigma = tf.sigmoid(layers.fc_layer('LogSigma', fc_2, latent_size))
     return variational_mean, variational_log_sigma
 
 
-def generative_net(input_tensor):
+def generative_net(input_tensor, code_length):
     """
     A network to rebuild the data from latent representation.
     :param input_tensor:
-    :return fc_3_mean:
-    :return fc_3_sigma:
+    :param code_length: hashing length
+    :return fc_3:
 
     """
     with tf.variable_scope(NAME_SCOPE_GENERATION):
-        fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 1024)
-        fc_2 = layers.fc_relu_layer('Fc2', fc_1, 1024)
-        fc_3_mean = layers.fc_layer('Fc3Mean', fc_2, 1024)
-        fc_3_sigma = layers.fc_layer('Fc3LogSigma', fc_2, 1024)
-    return fc_3_mean, fc_3_sigma
+        fc_1 = layers.fc_relu_layer('Fc1', input_tensor, 512)
+        fc_2 = layers.fc_relu_layer('Fc2', fc_1, 512)
+        fc_3 = layers.fc_layer('Fc3', fc_2, code_length)
+    return fc_3
 
 
 def recognition_net(input_tensor, label_size):
@@ -54,16 +56,20 @@ def recognition_net(input_tensor, label_size):
     return prob
 
 
-def loss_kl(variational_mean, variational_log_sigma):
+def loss_kl(variational_mean_1, variational_log_sigma_1, variational_mean_2, variational_log_sigma_2):
     """
-    KL-Divergence of q(z|x) and p(z)
-    :param variational_mean:
-    :param variational_log_sigma:
+    KL-Divergence of two Gaussian distributions:
+        log(s2/s1) +  (s1^2 + (u1-u2)^2)/(2*s2^2) -1/2
+    :param variational_mean_1:
+    :param variational_log_sigma_1:
+    :param variational_mean_2:
+    :param variational_log_sigma_2:
     :return:
     """
-    variational_loss = -0.5 * tf.reduce_sum(
-        1 + variational_log_sigma - tf.square(variational_mean) - tf.exp(variational_log_sigma), axis=1)
-    return variational_loss
+    l1 = (variational_log_sigma_2 - variational_log_sigma_1) * 0.5
+    l2 = tf.div(tf.exp(variational_log_sigma_1) + tf.square((variational_mean_1 - variational_mean_2)),
+                2 * tf.exp(variational_log_sigma_2 + 1e-6))
+    return l1 + l2 + 0.5
 
 
 def loss_px(generated_mean, generated_log_sigma, real_data):
@@ -80,37 +86,80 @@ def loss_px(generated_mean, generated_log_sigma, real_data):
     return generative_loss
 
 
-def binary_code_learning_process(matrix_f, orthogonal_rotation, aux_binaries, code_length, iteration=3):
-    def loop_body(f, r, b):
+def binary_code_learning_process(matrix_f, iteration=3):
+    def loop_body(f, r, b, i):
+        b = tf.sign(tf.matmul(r, f))
         a, _, c = tf.svd(tf.matmul(b, f, transpose_b=True))
         r = tf.matmul(a, c)
-        b = tf.sign(tf.matmul(r, f))
+        return f, r, b, tf.add(i, 1)
 
-        with tf.variable_scope(NAME_SCOPE_CODE_LEARNING, reuse=True):
-            bins = tf.cast(tf.greater(tf.random_normal([code_length, code_length]), 0), tf.float32)
-            assign_b = tf.assign(tf.get_variable('MatrixB'), bins)
+    def loop_cond(f, r, b, i):
+        return tf.greater(i, tf.constant(iteration))
 
-    with tf.control_dependencies([assign_b]):
+    with tf.variable_scope(NAME_SCOPE_CODE_LEARNING, reuse=True):
+        # bins = tf.cast(tf.greater(tf.random_normal([code_length, code_length]), 0), tf.float32)
+        iter_count = tf.constant(0)
+        orthogonal_rotation = tf.get_variable('MatrixR')
+        _, value_r, value_b, _ = tf.while_loop(loop_cond, loop_body, [matrix_f, orthogonal_rotation, 0, iter_count],
+                                               back_prop=False)
+        assign_r = tf.assign(orthogonal_rotation, value_r)
 
-    return 0
+    return assign_r, value_r, value_b
 
 
-class BinaryEncodingVae(object):
-    def __init__(self, code_length, sess=tf.Session(), feature_length=1024, label_num=60):
+class BinaryEncodingCVAE(object):
+    def __init__(self, code_length, latent_size=512, feature_length=1024, label_num=60, sess=tf.Session()):
         self.sess = sess
         self.code_length = code_length
+        self.latent_size = latent_size
         self.data_feature = tf.placeholder(tf.float32, [None, feature_length])
         self.data_label = tf.placeholder(tf.float32, [None, label_num])
         with tf.variable_scope(NAME_SCOPE_CODE_LEARNING):
             self.matrix_r = tf.Variable(initial_value=tf.eye(code_length, code_length), name='MatrixR', trainable=False)
             self.matrix_b = tf.Variable(initial_value=tf.random_normal(code_length, code_length), name='MatrixB',
                                         trainable=False)
+        self.nets = self._build_graph()
+        self.loss = self._build_loss()
+        self.g_step = tf.Variable(0, trainable=False)
 
     def _build_graph(self):
-        variational_mean, variational_log_sigma = variational_net(self.data_feature, self.code_length)
+        """
+        To build the networks: p(z|x), q(b|x,z), q(z|x,b) and some other components
+        :return:
+        """
+        variational_mean, variational_log_sigma = variational_net(self.data_feature, self.latent_size,
+                                                                  SUB_SCOPE_VARIATION_PZX)
         batch_size = self.data_feature.get_shape().as_list()[0]
-        # sample the reparameterized latent distribution with a set of random variable 'epsilon'.
+
+        # step 1: sample the latent space to obtain z
         eps = tf.random_normal([batch_size, self.code_length], stddev=0.5)
         sampled_latent_reps = variational_mean + tf.multiply(eps, variational_log_sigma)
 
+        # step 2: render z and x to q(b|z,x) and then obtain sampled b
+        feature_in_qb = tf.concat([self.data_feature, sampled_latent_reps], axis=1)
+        code_prototype = generative_net(feature_in_qb, self.code_length)
+
+        # step 3: build q(z|b,x)
+        feature_in_qz = tf.concat([self.data_feature, code_prototype], axis=1)
+        variational_mean_1, variational_log_sigma_1 = variational_net(feature_in_qz, self.latent_size,
+                                                                      SUB_SCOPE_VARIATION_PZXB)
+
+        return variational_mean, variational_log_sigma, variational_mean_1, variational_log_sigma_1, code_prototype
+
+    def _build_loss(self):
+        assigner, rotation, codes = binary_code_learning_process(tf.transpose(self.nets[4]))
+        with tf.control_dependencies([assigner]):
+            # learning objective 1: code regression
+            loss_1 = tf.nn.l2_loss(tf.matmul(rotation, codes, transpose_b=True))
+
+            # learning objective 2: kl-divergence between q(z|x,b) and p(z|x).
+            # Note that q(z|x,b) should be placed before p(z|x)
+            loss_2 = loss_kl(self.nets[2], self.nets[3], self.nets[0], self.nets[1])
+
+        return loss_1 + loss_2
+
+    def _get_optimizer(self):
+        return tf.train.AdamOptimizer(learning_rate=0.0001).minimize(self.loss)
+
+    def forward_and_backward(self, max_iter=100000):
         return 0
