@@ -10,6 +10,9 @@ NAME_SCOPE_GENERATION = 'GenerativeNet'
 NAME_SCOPE_RECOGNITION = 'RecognitionNet'
 NAME_SCOPE_CODE_LEARNING = 'CodeLearning'
 
+PATH_SUMMARY = 'E:\\WorkSpace\\WorkSpace\\TrainingLogs'
+PATH_SNAPSHOT = 'E:\\WorkSpace\\WorkSpace\\SavedModels\\BVAE'
+
 
 def variational_net(input_tensor, latent_size, sub_scope):
     """
@@ -88,6 +91,13 @@ def loss_px(generated_mean, generated_log_sigma, real_data):
 
 
 def binary_code_learning_process(matrix_f, code_length, iteration=3):
+    """
+    Binary code optimization process
+    :param matrix_f:
+    :param code_length:
+    :param iteration:
+    :return:
+    """
     def loop_body(f, r, b, i):
         b = tf.sign(tf.matmul(r, f))
         a, _, c = tf.svd(tf.matmul(b, f, transpose_b=True))
@@ -110,17 +120,22 @@ def binary_code_learning_process(matrix_f, code_length, iteration=3):
 
 class BinaryEncodingCVAE(object):
     def __init__(self, code_length, latent_size=512, feature_length=1024, label_num=60, sess=tf.Session(),
-                 restore_file=None):
+                 restore_file=None, batch_reader=None):
         self.sess = sess
         self.code_length = code_length
         self.latent_size = latent_size
         self.data_feature = tf.placeholder(tf.float32, [None, feature_length])
         self.data_label = tf.placeholder(tf.float32, [None, label_num])
         self.restore_file = restore_file
+        self.batch_reader = batch_reader
         with tf.variable_scope(NAME_SCOPE_CODE_LEARNING):
             self.matrix_r = tf.Variable(initial_value=tf.eye(code_length, code_length), name='MatrixR', trainable=False)
             self.matrix_b = tf.Variable(initial_value=tf.random_normal(code_length, code_length), name='MatrixB',
                                         trainable=False)
+
+        tf.summary.image(NAME_SCOPE_CODE_LEARNING + '/Orthogonality',
+                         tf.matmul(self.matrix_r, self.matrix_r, transpose_a=True))
+
         self.nets = self._build_graph()
         self.loss = self._build_loss()
         self.opt = self._get_optimizer()
@@ -148,6 +163,10 @@ class BinaryEncodingCVAE(object):
         variational_mean_1, variational_log_sigma_1 = variational_net(feature_in_qz, self.latent_size,
                                                                       SUB_SCOPE_VARIATION_PZXB)
 
+        code_out = tf.sign(tf.matmul(self.matrix_r, code_prototype, transpose_b=True))
+        tf.summary.scalar(NAME_SCOPE_GENERATION + '/CodeSum',
+                          tf.reduce_mean(code_out) / (batch_size * self.code_length))
+
         return variational_mean, variational_log_sigma, variational_mean_1, variational_log_sigma_1, code_prototype
 
     def _build_loss(self):
@@ -155,12 +174,16 @@ class BinaryEncodingCVAE(object):
         with tf.control_dependencies([assigner]):
             # learning objective 1: code regression
             loss_1 = tf.nn.l2_loss(tf.matmul(rotation, codes, transpose_b=True))
+            tf.summary.scalar('Losses/Loss1', loss_1)
 
             # learning objective 2: kl-divergence between q(z|x,b) and p(z|x).
             # Note that q(z|x,b) should be placed before p(z|x)
             loss_2 = tf.reduce_sum(loss_kl(self.nets[2], self.nets[3], self.nets[0], self.nets[1]))
+            tf.summary.scalar('Losses/Loss2', loss_2)
 
-        return loss_1 + loss_2
+            loss_out = loss_1 + loss_2
+            tf.summary.scalar('Losses/TotalLoss', loss_out)
+        return loss_out
 
     def _get_optimizer(self):
         return tf.train.AdamOptimizer(learning_rate=0.0001).minimize(self.loss, global_step=self.g_step)
@@ -171,8 +194,11 @@ class BinaryEncodingCVAE(object):
             restore_file = self.restore_file
         return saver.restore(self.sess, restore_file)
 
-    def run_training(self, batch_reader, max_iter=100000, summary_path='\\TrainingLogs',
-                     snapshot_path='\\SavedModels\\VAE'):
+    def run_training(self, max_iter=100000, summary_path=PATH_SUMMARY, snapshot_path=PATH_SNAPSHOT, batch_reader=None):
+        if batch_reader is None:
+            batch_reader = self.batch_reader
+        assert batch_reader is not None
+
         init_op = tf.global_variables_initializer()
         self.sess.run(init_op)
         if self.restore_file is not None:
@@ -191,3 +217,21 @@ class BinaryEncodingCVAE(object):
 
             if (i + 1) % 5000 == 0:
                 saver.save(self.sess, snapshot_path + '/YMModel', global_step=step_count)
+
+    def forward(self, batch_data):
+        to_run = tf.matmul(self.matrix_r, self.nets[4], transpose_b=True)
+        to_run = tf.sign(to_run)
+        codes = self.sess.run(to_run, feed_dict={self.data_feature: batch_data.get('batch_feat')})
+        return codes
+
+
+if __name__ == '__main__':
+    from util.data_reader import reader_feat_only
+
+    config = tf.ConfigProto(allow_soft_placement=True, log_device_placement=False)
+    config.gpu_options.allow_growth = True
+    this_session = tf.Session(config=config)
+    model = BinaryEncodingCVAE(code_length=32, feature_length=4096, label_num=397, sess=this_session,
+                               batch_reader=reader_feat_only)
+
+    model.run_training()
