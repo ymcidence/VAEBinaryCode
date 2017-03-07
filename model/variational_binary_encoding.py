@@ -1,5 +1,6 @@
 import tensorflow as tf
 import cmath
+from time import gmtime, strftime
 from util import layers
 
 NAME_SCOPE_VARIATION = 'VariationalNet'
@@ -74,7 +75,7 @@ def loss_kl(variational_mean_1, variational_log_sigma_1, variational_mean_2, var
 
 def loss_px(generated_mean, generated_log_sigma, real_data):
     """
-    p(x|z)
+    p(x|z), not used here
     :param generated_mean:
     :param generated_log_sigma:
     :param real_data:
@@ -86,7 +87,7 @@ def loss_px(generated_mean, generated_log_sigma, real_data):
     return generative_loss
 
 
-def binary_code_learning_process(matrix_f, iteration=3):
+def binary_code_learning_process(matrix_f, code_length, iteration=3):
     def loop_body(f, r, b, i):
         b = tf.sign(tf.matmul(r, f))
         a, _, c = tf.svd(tf.matmul(b, f, transpose_b=True))
@@ -97,10 +98,10 @@ def binary_code_learning_process(matrix_f, iteration=3):
         return tf.greater(i, tf.constant(iteration))
 
     with tf.variable_scope(NAME_SCOPE_CODE_LEARNING, reuse=True):
-        # bins = tf.cast(tf.greater(tf.random_normal([code_length, code_length]), 0), tf.float32)
+        bins = tf.cast(tf.greater(tf.random_normal([code_length, code_length]), 0), tf.float32)
         iter_count = tf.constant(0)
         orthogonal_rotation = tf.get_variable('MatrixR')
-        _, value_r, value_b, _ = tf.while_loop(loop_cond, loop_body, [matrix_f, orthogonal_rotation, 0, iter_count],
+        _, value_r, value_b, _ = tf.while_loop(loop_cond, loop_body, [matrix_f, orthogonal_rotation, bins, iter_count],
                                                back_prop=False)
         assign_r = tf.assign(orthogonal_rotation, value_r)
 
@@ -108,18 +109,21 @@ def binary_code_learning_process(matrix_f, iteration=3):
 
 
 class BinaryEncodingCVAE(object):
-    def __init__(self, code_length, latent_size=512, feature_length=1024, label_num=60, sess=tf.Session()):
+    def __init__(self, code_length, latent_size=512, feature_length=1024, label_num=60, sess=tf.Session(),
+                 restore_file=None):
         self.sess = sess
         self.code_length = code_length
         self.latent_size = latent_size
         self.data_feature = tf.placeholder(tf.float32, [None, feature_length])
         self.data_label = tf.placeholder(tf.float32, [None, label_num])
+        self.restore_file = restore_file
         with tf.variable_scope(NAME_SCOPE_CODE_LEARNING):
             self.matrix_r = tf.Variable(initial_value=tf.eye(code_length, code_length), name='MatrixR', trainable=False)
             self.matrix_b = tf.Variable(initial_value=tf.random_normal(code_length, code_length), name='MatrixB',
                                         trainable=False)
         self.nets = self._build_graph()
         self.loss = self._build_loss()
+        self.opt = self._get_optimizer()
         self.g_step = tf.Variable(0, trainable=False)
 
     def _build_graph(self):
@@ -147,19 +151,43 @@ class BinaryEncodingCVAE(object):
         return variational_mean, variational_log_sigma, variational_mean_1, variational_log_sigma_1, code_prototype
 
     def _build_loss(self):
-        assigner, rotation, codes = binary_code_learning_process(tf.transpose(self.nets[4]))
+        assigner, rotation, codes = binary_code_learning_process(tf.transpose(self.nets[4]), self.code_length)
         with tf.control_dependencies([assigner]):
             # learning objective 1: code regression
             loss_1 = tf.nn.l2_loss(tf.matmul(rotation, codes, transpose_b=True))
 
             # learning objective 2: kl-divergence between q(z|x,b) and p(z|x).
             # Note that q(z|x,b) should be placed before p(z|x)
-            loss_2 = loss_kl(self.nets[2], self.nets[3], self.nets[0], self.nets[1])
+            loss_2 = tf.reduce_sum(loss_kl(self.nets[2], self.nets[3], self.nets[0], self.nets[1]))
 
         return loss_1 + loss_2
 
     def _get_optimizer(self):
-        return tf.train.AdamOptimizer(learning_rate=0.0001).minimize(self.loss)
+        return tf.train.AdamOptimizer(learning_rate=0.0001).minimize(self.loss, global_step=self.g_step)
 
-    def forward_and_backward(self, max_iter=100000):
-        return 0
+    def _restore(self, restore_file=None):
+        saver = tf.train.Saver()
+        if restore_file is None:
+            restore_file = self.restore_file
+        return saver.restore(self.sess, restore_file)
+
+    def run_training(self, batch_reader, max_iter=100000, summary_path='\\TrainingLogs',
+                     snapshot_path='\\SavedModels\\VAE'):
+        init_op = tf.global_variables_initializer()
+        self.sess.run(init_op)
+        if self.restore_file is not None:
+            self._restore()
+        time_string = strftime("%a%d%b%Y-%H%M%S", gmtime())
+        writer = tf.summary.FileWriter(summary_path + '/' + time_string + '/')
+        saver = tf.train.Saver()
+        summary_op = tf.summary.merge_all()
+        for i in range(max_iter):
+            this_batch = batch_reader(i)
+            batch_feature = this_batch.get('batch_feat')
+            step_count, this_loss, summaries, _ = self.sess.run([self.g_step, self.loss, summary_op, self.opt],
+                                                                feed_dict={self.data_feature: batch_feature})
+            print('Iteration ' + str(i) + '(Global Step: ' + str(step_count) + '): ' + str(this_loss))
+            writer.add_summary(summaries, global_step=step_count)
+
+            if (i + 1) % 5000 == 0:
+                saver.save(self.sess, snapshot_path + '/YMModel', global_step=step_count)
